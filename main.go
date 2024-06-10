@@ -15,49 +15,38 @@ type server struct {
 }
 
 func newServer(id string, node *maelstrom.Node) *server {
-	s := server{id: id, node: node}
-	return &s
+	return &server{id: id, node: node}
 }
 
-func (s *server) handleEcho(body map[string]any, msg maelstrom.Message) (maelstrom.Message, map[string]any) {
+func (s *server) handleEcho(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 	// Update the message type to return back
 	body["type"] = "echo_ok"
 
-	return msg, body
+	return s.node.Reply(msg, body)
 }
 
-func (s *server) handleGenerate(body map[string]any, msg maelstrom.Message) (maelstrom.Message, map[string]any) {
+func (s *server) handleGenerate(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
 	body["type"] = "generate_ok"
-	body["id"] = uuid.New()
+	body["id"] = uuid.New().String()
 
-	return msg, body
+	return s.node.Reply(msg, body)
 }
 
 func main() {
-	n := maelstrom.NewNode()
-	s := newServer(uuid.New().String(), n)
+	s := newServer(uuid.New().String(), maelstrom.NewNode())
 
-	n.Handle("echo", func(msg maelstrom.Message) error {
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
+	s.node.Handle("echo", s.handleEcho)
+	s.node.Handle("generate", s.handleGenerate)
 
-		newBody, newMsg := s.handleEcho(body, msg)
-		return n.Reply(newBody, newMsg)
-	})
-
-	n.Handle("generate", func(msg maelstrom.Message) error {
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		newBody, newMsg := s.handleGenerate(body, msg)
-		return n.Reply(newBody, newMsg)
-	})
-
-	if err := n.Run(); err != nil {
+	if err := s.node.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
