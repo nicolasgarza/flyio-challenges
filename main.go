@@ -28,7 +28,7 @@ func (s *server) handleEcho(body map[string]any, msg maelstrom.Message) (maelstr
 
 func (s *server) handleGenerate(body map[string]any, msg maelstrom.Message) (maelstrom.Message, map[string]any) {
 	body["type"] = "generate_ok"
-	body["id"] = s.id
+	body["id"] = uuid.New()
 
 	return msg, body
 }
@@ -42,6 +42,7 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
 		newBody, newMsg := s.handleEcho(body, msg)
 		return n.Reply(newBody, newMsg)
 	})
@@ -51,6 +52,7 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
 		newBody, newMsg := s.handleGenerate(body, msg)
 		return n.Reply(newBody, newMsg)
 	})
