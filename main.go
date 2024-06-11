@@ -10,13 +10,14 @@ import (
 )
 
 type server struct {
-	id    string
-	node  *maelstrom.Node
-	store []int
+	id       string
+	node     *maelstrom.Node
+	store    map[int]struct{}
+	received []int
 }
 
 func newServer(id string, node *maelstrom.Node) *server {
-	return &server{id: id, node: node, store: []int{}}
+	return &server{id: id, node: node, store: make(map[int]struct{}), received: []int{}}
 }
 
 func (s *server) handleEcho(msg maelstrom.Message) error {
@@ -46,8 +47,20 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
+
 	body["type"] = "broadcast_ok"
-	s.store = append(s.store, body["message"].(int))
+	recieved_int := int(body["message"].(float64))
+
+	if _, exists := s.store[recieved_int]; exists {
+		// early return if we have already received int, don't broadcast
+		delete(body, "message")
+		return s.node.Reply(msg, body)
+	}
+
+	s.store[recieved_int] = struct{}{}
+	s.received = append(s.received, recieved_int)
+	s.broadcastMsg(recieved_int)
+	delete(body, "message")
 
 	return s.node.Reply(msg, body)
 }
@@ -59,7 +72,7 @@ func (s *server) handleRead(msg maelstrom.Message) error {
 	}
 
 	body["type"] = "read_ok"
-	body["messages"] = s.store
+	body["messages"] = s.received
 
 	return s.node.Reply(msg, body)
 }
@@ -71,7 +84,18 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 	}
 
 	body["type"] = "topology_ok"
+	delete(body, "topology")
 	return s.node.Reply(msg, body)
+}
+
+func (s *server) broadcastMsg(msg int) {
+	send_msg := map[string]any{
+		"type":    "broadcast",
+		"message": msg,
+	}
+	for _, n := range s.node.NodeIDs() {
+		s.node.RPC(n, send_msg, func(msg maelstrom.Message) error { return nil })
+	}
 }
 
 func main() {
