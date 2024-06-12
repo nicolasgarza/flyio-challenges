@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,10 +25,16 @@ const (
 	TopologyOkType  = "topology_ok"
 )
 
+const (
+	DefaultRetries = 3
+	DefaultTimeout = 2 * time.Second
+)
+
 type server struct {
 	node     *maelstrom.Node
 	store    map[int]struct{}
 	received []int
+	mu       sync.Mutex
 }
 
 func newServer(node *maelstrom.Node) *server {
@@ -63,15 +70,15 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 	}
 
 	body["type"] = BroadcastOkType
-	recieved_int := int(body["message"].(float64))
+	receivedInt := int(body["message"].(float64))
 
-	if s.isMessageReceived(recieved_int) {
+	if s.isMessageReceived(receivedInt) {
 		// early return if we have already received int, don't broadcast
 		return s.replyBroadcastOk(msg, body)
 	}
 
-	s.storeMessage(recieved_int)
-	go s.broadcastMsg(recieved_int, 3, 2*time.Second)
+	s.storeMessage(receivedInt)
+	go s.broadcastMsg(receivedInt, DefaultRetries, DefaultTimeout)
 	return s.replyBroadcastOk(msg, body)
 }
 
@@ -81,8 +88,10 @@ func (s *server) handleRead(msg maelstrom.Message) error {
 		return err
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	body["type"] = ReadOkType
-	body["messages"] = s.received
+	body["messages"] = append([]int(nil), s.received...)
 
 	return s.node.Reply(msg, body)
 }
@@ -127,11 +136,15 @@ func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
 }
 
 func (s *server) storeMessage(msg int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.store[msg] = struct{}{}
 	s.received = append(s.received, msg)
 }
 
 func (s *server) isMessageReceived(msg int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, exists := s.store[msg]
 	return exists
 }
