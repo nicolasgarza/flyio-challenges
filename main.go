@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
@@ -72,11 +71,7 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 	}
 
 	s.storeMessage(recieved_int)
-	go func(recieved_int int) {
-		if err := s.broadcastMsg(recieved_int, 3, 2*time.Second); err != nil {
-			log.Printf("Failed to broadcast message after retries: %v", err)
-		}
-	}(recieved_int)
+	go s.broadcastMsg(recieved_int, 3, 2*time.Second)
 	return s.replyBroadcastOk(msg, body)
 }
 
@@ -103,7 +98,7 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 	return s.node.Reply(msg, body)
 }
 
-func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) error {
+func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
 	send_msg := map[string]any{
 		"type":    BroadcastType,
 		"message": msg,
@@ -114,22 +109,21 @@ func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) error
 		}
 		for i := 0; i < retries; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
 
 			_, err := s.node.SyncRPC(ctx, n, send_msg)
+			cancel()
+
 			if err == nil {
 				break
 			}
 
 			if i == retries-1 {
-				return fmt.Errorf("failed to send message to %s after %d retries: %v", n, retries, err)
+				log.Printf("failed to send message to %s after %d retries: %v", n, retries, err)
 			}
 
 			log.Printf("Retrying to send message to %s (%d/%d): %v", n, i+1, retries, err)
 		}
 	}
-
-	return nil
 }
 
 func (s *server) storeMessage(msg int) {
