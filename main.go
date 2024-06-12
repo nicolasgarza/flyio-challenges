@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -23,14 +26,13 @@ const (
 )
 
 type server struct {
-	id       string
 	node     *maelstrom.Node
 	store    map[int]struct{}
 	received []int
 }
 
-func newServer(id string, node *maelstrom.Node) *server {
-	return &server{id: id, node: node, store: make(map[int]struct{}), received: []int{}}
+func newServer(node *maelstrom.Node) *server {
+	return &server{node: node, store: make(map[int]struct{}), received: []int{}}
 }
 
 func (s *server) handleEcho(msg maelstrom.Message) error {
@@ -70,7 +72,11 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 	}
 
 	s.storeMessage(recieved_int)
-	s.broadcastMsg(recieved_int)
+	go func(recieved_int int) {
+		if err := s.broadcastMsg(recieved_int, 3, 2*time.Second); err != nil {
+			log.Printf("Failed to broadcast message after retries: %v", err)
+		}
+	}(recieved_int)
 	return s.replyBroadcastOk(msg, body)
 }
 
@@ -97,14 +103,33 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 	return s.node.Reply(msg, body)
 }
 
-func (s *server) broadcastMsg(msg int) {
+func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) error {
 	send_msg := map[string]any{
 		"type":    BroadcastType,
 		"message": msg,
 	}
 	for _, n := range s.node.NodeIDs() {
-		s.node.RPC(n, send_msg, func(msg maelstrom.Message) error { return nil })
+		if n == s.node.ID() {
+			continue
+		}
+		for i := 0; i < retries; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			_, err := s.node.SyncRPC(ctx, n, send_msg)
+			if err == nil {
+				break
+			}
+
+			if i == retries-1 {
+				return fmt.Errorf("failed to send message to %s after %d retries: %v", n, retries, err)
+			}
+
+			log.Printf("Retrying to send message to %s (%d/%d): %v", n, i+1, retries, err)
+		}
 	}
+
+	return nil
 }
 
 func (s *server) storeMessage(msg int) {
@@ -123,7 +148,7 @@ func (s *server) replyBroadcastOk(msg maelstrom.Message, body map[string]any) er
 }
 
 func main() {
-	s := newServer(uuid.New().String(), maelstrom.NewNode())
+	s := newServer(maelstrom.NewNode())
 
 	s.node.Handle(EchoType, s.handleEcho)
 	s.node.Handle(GenerateType, s.handleGenerate)
