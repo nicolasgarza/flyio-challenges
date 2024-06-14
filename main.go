@@ -32,13 +32,14 @@ const (
 
 type server struct {
 	node     *maelstrom.Node
+	topology []string
 	store    map[int]struct{}
 	received []int
 	mu       sync.Mutex
 }
 
 func newServer(node *maelstrom.Node) *server {
-	return &server{node: node, store: make(map[int]struct{}), received: []int{}}
+	return &server{node: node, topology: []string{}, store: make(map[int]struct{}), received: []int{}}
 }
 
 func (s *server) handleEcho(msg maelstrom.Message) error {
@@ -102,6 +103,14 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 		return err
 	}
 
+	topologyData := body["topology"].(map[string]interface{})
+	nodeList := topologyData[s.node.ID()].([]interface{})
+
+	s.topology = make([]string, len(nodeList))
+	for i, node := range nodeList {
+		s.topology[i] = node.(string)
+	}
+
 	body["type"] = TopologyOkType
 	delete(body, TopologyType)
 	return s.node.Reply(msg, body)
@@ -112,10 +121,8 @@ func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
 		"type":    BroadcastType,
 		"message": msg,
 	}
-	for _, n := range s.node.NodeIDs() {
-		if n == s.node.ID() {
-			continue
-		}
+
+	for _, n := range s.topology {
 		for i := 0; i < retries; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
