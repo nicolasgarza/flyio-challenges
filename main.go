@@ -122,23 +122,29 @@ func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
 		"message": msg,
 	}
 
+	var wg sync.WaitGroup
 	for _, n := range s.topology {
-		for i := 0; i < retries; i++ {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			_, err := s.node.SyncRPC(ctx, n, send_msg)
-			cancel()
+		wg.Add(1)
+		go func(n string) {
+			defer wg.Done()
+			for i := 0; i < retries; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				_, err := s.node.SyncRPC(ctx, n, send_msg)
+				cancel()
 
-			if err == nil {
-				break
+				if err == nil {
+					break
+				}
+
+				if i == retries-1 {
+					log.Printf("failed to send message to %s after %d retries: %v", n, retries, err)
+				}
+
+				log.Printf("Retrying to send message to %s (%d/%d): %v", n, i+1, retries, err)
 			}
-
-			if i == retries-1 {
-				log.Printf("failed to send message to %s after %d retries: %v", n, retries, err)
-			}
-
-			log.Printf("Retrying to send message to %s (%d/%d): %v", n, i+1, retries, err)
-		}
+		}(n)
 	}
+	wg.Wait()
 }
 
 func (s *server) storeMessage(msg int) {
