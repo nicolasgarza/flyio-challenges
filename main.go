@@ -27,7 +27,7 @@ const (
 
 const (
 	DefaultRetries = 3
-	DefaultTimeout = 2 * time.Second
+	DefaultTimeout = 1 * time.Second
 )
 
 type server struct {
@@ -35,7 +35,7 @@ type server struct {
 	topology []string
 	store    map[int]struct{}
 	received []int
-	mu       sync.Mutex
+	mu       sync.RWMutex
 }
 
 func newServer(node *maelstrom.Node) *server {
@@ -89,8 +89,8 @@ func (s *server) handleRead(msg maelstrom.Message) error {
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	body["type"] = ReadOkType
 	body["messages"] = append([]int(nil), s.received...)
 
@@ -125,7 +125,6 @@ func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
 	for _, n := range s.topology {
 		for i := 0; i < retries; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-
 			_, err := s.node.SyncRPC(ctx, n, send_msg)
 			cancel()
 
@@ -150,8 +149,8 @@ func (s *server) storeMessage(msg int) {
 }
 
 func (s *server) isMessageReceived(msg int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	_, exists := s.store[msg]
 	return exists
 }
