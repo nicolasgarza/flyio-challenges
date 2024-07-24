@@ -27,7 +27,7 @@ const (
 
 const (
 	DefaultRetries = 3
-	DefaultTimeout = 1 * time.Second
+	DefaultTimeout = 2 * time.Second
 )
 
 type server struct {
