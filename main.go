@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ const (
 	ReadOkType      = "read_ok"
 	TopologyType    = "topology"
 	TopologyOkType  = "topology_ok"
+	GossipType      = "gossip"
 )
 
 const (
@@ -31,15 +33,22 @@ const (
 )
 
 type server struct {
-	node     *maelstrom.Node
-	topology []string
-	store    map[int]struct{}
-	received []int
-	mu       sync.RWMutex
+	node        *maelstrom.Node
+	topology    []string
+	store       map[int]struct{}
+	received    []int
+	mu          sync.RWMutex
+	newMessages chan int
 }
 
 func newServer(node *maelstrom.Node) *server {
-	return &server{node: node, topology: []string{}, store: make(map[int]struct{}), received: []int{}}
+	return &server{
+		node:        node,
+		topology:    []string{},
+		store:       make(map[int]struct{}),
+		received:    []int{},
+		newMessages: make(chan int, 100),
+	}
 }
 
 func (s *server) handleEcho(msg maelstrom.Message) error {
@@ -70,17 +79,20 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 		return err
 	}
 
-	body["type"] = BroadcastOkType
-	receivedInt := int(body["message"].(float64))
-
-	if s.isMessageReceived(receivedInt) {
-		// early return if we have already received int, don't broadcast
-		return s.replyBroadcastOk(msg, body)
+	if messages, ok := body["messages"].([]interface{}); ok {
+		for _, m := range messages {
+			if intMsg, ok := m.(float64); ok {
+				s.storeMessage(int(intMsg))
+			}
+		}
+	} else if singleMsg, ok := body["message"].(float64); ok {
+		s.storeMessage(int(singleMsg))
 	}
 
-	s.storeMessage(receivedInt)
-	go s.broadcastMsg(receivedInt, DefaultRetries, DefaultTimeout)
-	return s.replyBroadcastOk(msg, body)
+	body["type"] = BroadcastOkType
+	delete(body, "message")
+	delete(body, "messages")
+	return s.node.Reply(msg, body)
 }
 
 func (s *server) handleRead(msg maelstrom.Message) error {
@@ -116,54 +128,81 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 	return s.node.Reply(msg, body)
 }
 
-func (s *server) broadcastMsg(msg int, retries int, timeout time.Duration) {
-	send_msg := map[string]any{
-		"type":    BroadcastType,
-		"message": msg,
-	}
-
-	var wg sync.WaitGroup
-	for _, n := range s.topology {
-		wg.Add(1)
-		go func(n string) {
-			defer wg.Done()
-			for i := 0; i < retries; i++ {
-				ctx, cancel := context.WithTimeout(context.Background(), timeout)
-				_, err := s.node.SyncRPC(ctx, n, send_msg)
-				cancel()
-
-				if err == nil {
-					break
-				}
-
-				if i == retries-1 {
-					log.Printf("failed to send message to %s after %d retries: %v", n, retries, err)
-				}
-
-				log.Printf("Retrying to send message to %s (%d/%d): %v", n, i+1, retries, err)
+func (s *server) startGossip() {
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		for {
+			select {
+			case <-ticker.C:
+				s.gossipToRandomNodes(nil)
+			case msg := <-s.newMessages:
+				s.gossipToRandomNodes([]int{msg})
 			}
-		}(n)
+		}
+	}()
+}
+
+func (s *server) gossipToRandomNodes(newMsg []int) {
+	s.mu.RLock()
+	messages := append([]int(nil), s.received...)
+	s.mu.RUnlock()
+
+	if newMsg != nil {
+		messages = append(messages, newMsg...)
 	}
-	wg.Wait()
+
+	gossipMsg := map[string]any{
+		"type":     BroadcastType,
+		"messages": messages,
+	}
+
+	for _, nodeID := range s.getRandomNodes(2) {
+		go func(nodeID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+			defer cancel()
+			s.node.SyncRPC(ctx, nodeID, gossipMsg)
+		}(nodeID)
+	}
+}
+
+func (s *server) getRandomNodes(num int) []string {
+	allNodes := s.node.NodeIDs()
+	currentNodeID := s.node.ID()
+
+	// Remove the current node from the list
+	var otherNodes []string
+	for _, nodeID := range allNodes {
+		if nodeID != currentNodeID {
+			otherNodes = append(otherNodes, nodeID)
+		}
+	}
+
+	// Shuffle the slice of other nodes
+	rand.Shuffle(len(otherNodes), func(i, j int) {
+		otherNodes[i], otherNodes[j] = otherNodes[j], otherNodes[i]
+	})
+
+	// Return up to 'num' nodes, but no more than available
+	if len(otherNodes) < num {
+		return otherNodes
+	}
+	return otherNodes[:num]
 }
 
 func (s *server) storeMessage(msg int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.store[msg] = struct{}{}
-	s.received = append(s.received, msg)
-}
-
-func (s *server) isMessageReceived(msg int) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, exists := s.store[msg]
-	return exists
-}
-
-func (s *server) replyBroadcastOk(msg maelstrom.Message, body map[string]any) error {
-	delete(body, "message")
-	return s.node.Reply(msg, body)
+	if _, exists := s.store[msg]; !exists {
+		s.store[msg] = struct{}{}
+		s.received = append(s.received, msg)
+		s.mu.Unlock()
+		select {
+		case s.newMessages <- msg:
+		default:
+			// channel full, msg will be propogated in next gossip round
+		}
+	} else {
+		s.mu.Unlock()
+	}
 }
 
 func main() {
@@ -174,6 +213,7 @@ func main() {
 	s.node.Handle(BroadcastType, s.handleBroadcast)
 	s.node.Handle(ReadType, s.handleRead)
 	s.node.Handle(TopologyType, s.handleTopology)
+	s.startGossip()
 
 	if err := s.node.Run(); err != nil {
 		log.Fatal(err)
