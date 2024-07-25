@@ -28,8 +28,9 @@ const (
 )
 
 const (
-	DefaultRetries = 3
 	DefaultTimeout = 2 * time.Second
+	BatchSize      = 100
+	GossipInterval = 500 * time.Millisecond
 )
 
 type server struct {
@@ -39,6 +40,8 @@ type server struct {
 	received    []int
 	mu          sync.RWMutex
 	newMessages chan int
+	lastSent    int
+	gossipTimer *time.Timer
 }
 
 func newServer(node *maelstrom.Node) *server {
@@ -48,6 +51,8 @@ func newServer(node *maelstrom.Node) *server {
 		store:       make(map[int]struct{}),
 		received:    []int{},
 		newMessages: make(chan int, 100),
+		lastSent:    0,
+		gossipTimer: time.NewTimer(GossipInterval),
 	}
 }
 
@@ -80,18 +85,20 @@ func (s *server) handleBroadcast(msg maelstrom.Message) error {
 	}
 
 	if messages, ok := body["messages"].([]interface{}); ok {
-		for _, m := range messages {
+		lastSent := int(body["last_sent"].(float64))
+		for i, m := range messages {
 			if intMsg, ok := m.(float64); ok {
-				s.storeMessage(int(intMsg))
+				s.storeMessage(int(intMsg), lastSent+i)
 			}
 		}
 	} else if singleMsg, ok := body["message"].(float64); ok {
-		s.storeMessage(int(singleMsg))
+		s.storeMessage(int(singleMsg), -1)
 	}
 
 	body["type"] = BroadcastOkType
 	delete(body, "message")
 	delete(body, "messages")
+	delete(body, "last_sent")
 	return s.node.Reply(msg, body)
 }
 
@@ -130,11 +137,11 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 
 func (s *server) startGossip() {
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
 		for {
 			select {
-			case <-ticker.C:
+			case <-s.gossipTimer.C:
 				s.gossipToRandomNodes(nil)
+				s.adjustGossipInterval()
 			case msg := <-s.newMessages:
 				s.gossipToRandomNodes([]int{msg})
 			}
@@ -144,25 +151,38 @@ func (s *server) startGossip() {
 
 func (s *server) gossipToRandomNodes(newMsg []int) {
 	s.mu.RLock()
-	messages := append([]int(nil), s.received...)
+	messages := append([]int(nil), s.received[max(0, len(s.received)-BatchSize):]...)
+	lastSent := s.lastSent
 	s.mu.RUnlock()
+
+	if len(messages) == 0 && newMsg == nil {
+		return
+	}
 
 	if newMsg != nil {
 		messages = append(messages, newMsg...)
 	}
 
 	gossipMsg := map[string]any{
-		"type":     BroadcastType,
-		"messages": messages,
+		"type":      BroadcastType,
+		"messages":  messages,
+		"last_sent": lastSent,
 	}
 
 	for _, nodeID := range s.getRandomNodes(2) {
 		go func(nodeID string) {
 			ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 			defer cancel()
-			s.node.SyncRPC(ctx, nodeID, gossipMsg)
+			_, err := s.node.SyncRPC(ctx, nodeID, gossipMsg)
+			if err != nil {
+				log.Printf("Error gossiping to node %s: %v", nodeID, err)
+			}
 		}(nodeID)
 	}
+
+	s.mu.Lock()
+	s.lastSent = len(s.received)
+	s.mu.Unlock()
 }
 
 func (s *server) getRandomNodes(num int) []string {
@@ -189,19 +209,37 @@ func (s *server) getRandomNodes(num int) []string {
 	return otherNodes[:num]
 }
 
-func (s *server) storeMessage(msg int) {
+func (s *server) adjustGossipInterval() {
+	s.mu.RLock()
+	messageCount := len(s.received)
+	s.mu.RUnlock()
+
+	// adjust interval based on msg count
+	if messageCount > 1000 {
+		s.gossipTimer.Reset(100 * time.Millisecond)
+	} else if messageCount > 500 {
+		s.gossipTimer.Reset(250 * time.Millisecond)
+	} else {
+		s.gossipTimer.Reset(GossipInterval)
+	}
+}
+
+func (s *server) storeMessage(msg int, index int) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, exists := s.store[msg]; !exists {
 		s.store[msg] = struct{}{}
-		s.received = append(s.received, msg)
-		s.mu.Unlock()
+		if index >= 0 && index < len(s.received) {
+			// insert at correct position
+			s.received = append(s.received[:index], append([]int{msg}, s.received[index:]...)...)
+		} else {
+			s.received = append(s.received, msg)
+		}
 		select {
 		case s.newMessages <- msg:
 		default:
 			// channel full, msg will be propogated in next gossip round
 		}
-	} else {
-		s.mu.Unlock()
 	}
 }
 
