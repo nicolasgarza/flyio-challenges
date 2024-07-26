@@ -28,9 +28,9 @@ const (
 )
 
 const (
-	DefaultTimeout = 9 * time.Second
-	BatchSize      = 1000
-	GossipInterval = 15 * time.Second
+	DefaultTimeout = 2 * time.Second
+	BatchSize      = 750
+	GossipInterval = 3 * time.Second
 )
 
 type server struct {
@@ -181,7 +181,7 @@ func (s *server) gossipToRandomNodes(newMsg []int) {
 		"last_sent": lastSent,
 	}
 
-	for _, nodeID := range s.getRandomNodes(1) {
+	for _, nodeID := range s.getRandomNodes(2) {
 		go func(nodeID string) {
 			ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 			defer cancel()
@@ -223,20 +223,25 @@ func (s *server) getRandomNodes(num int) []string {
 
 func (s *server) storeMessage(msg int, index int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, exists := s.store[msg]; !exists {
 		s.store[msg] = struct{}{}
+		s.mu.Unlock()
+
+		s.mu.Lock()
 		if index >= 0 && index < len(s.received) {
-			// insert at correct position
 			s.received = append(s.received[:index], append([]int{msg}, s.received[index:]...)...)
 		} else {
 			s.received = append(s.received, msg)
 		}
+		s.mu.Unlock()
+
 		select {
 		case s.newMessages <- msg:
 		default:
-			// channel full, msg will be propogated in next gossip round
+			// channel full, msg will be propagated in next gossip round
 		}
+	} else {
+		s.mu.Unlock()
 	}
 }
 
