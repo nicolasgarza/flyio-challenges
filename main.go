@@ -28,9 +28,9 @@ const (
 )
 
 const (
-	DefaultTimeout = 2 * time.Second
-	BatchSize      = 100
-	GossipInterval = 500 * time.Millisecond
+	DefaultTimeout = 9 * time.Second
+	BatchSize      = 1000
+	GossipInterval = 15 * time.Second
 )
 
 type server struct {
@@ -137,13 +137,25 @@ func (s *server) handleTopology(msg maelstrom.Message) error {
 
 func (s *server) startGossip() {
 	go func() {
+		batchTicker := time.NewTicker(100 * time.Millisecond)
+		defer batchTicker.Stop()
+		batch := make([]int, 0, BatchSize)
 		for {
 			select {
 			case <-s.gossipTimer.C:
 				s.gossipToRandomNodes(nil)
-				s.adjustGossipInterval()
+				batch = batch[:0] // Clear the batch
 			case msg := <-s.newMessages:
-				s.gossipToRandomNodes([]int{msg})
+				batch = append(batch, msg)
+				if len(batch) >= BatchSize {
+					s.gossipToRandomNodes(batch)
+					batch = batch[:0] // Clear the batch
+				}
+			case <-batchTicker.C:
+				if len(batch) > 0 {
+					s.gossipToRandomNodes(batch)
+					batch = batch[:0] // Clear the batch
+				}
 			}
 		}
 	}()
@@ -169,7 +181,7 @@ func (s *server) gossipToRandomNodes(newMsg []int) {
 		"last_sent": lastSent,
 	}
 
-	for _, nodeID := range s.getRandomNodes(2) {
+	for _, nodeID := range s.getRandomNodes(1) {
 		go func(nodeID string) {
 			ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 			defer cancel()
@@ -209,21 +221,6 @@ func (s *server) getRandomNodes(num int) []string {
 	return otherNodes[:num]
 }
 
-func (s *server) adjustGossipInterval() {
-	s.mu.RLock()
-	messageCount := len(s.received)
-	s.mu.RUnlock()
-
-	// adjust interval based on msg count
-	if messageCount > 1000 {
-		s.gossipTimer.Reset(100 * time.Millisecond)
-	} else if messageCount > 500 {
-		s.gossipTimer.Reset(250 * time.Millisecond)
-	} else {
-		s.gossipTimer.Reset(GossipInterval)
-	}
-}
-
 func (s *server) storeMessage(msg int, index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,4 +253,5 @@ func main() {
 	if err := s.node.Run(); err != nil {
 		log.Fatal(err)
 	}
+	log.Println("Program done")
 }
