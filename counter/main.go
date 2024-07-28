@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"os"
-	"path/filepath"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
+
+const counterKey = "counter"
 
 type Server struct {
 	Node        *maelstrom.Node
@@ -24,20 +26,17 @@ func NewServer(node *maelstrom.Node, kv_store *maelstrom.KV) *Server {
 }
 
 func main() {
-	// logFile := setupLogger()
-	// defer logFile.Close()
-
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
 	s := NewServer(n, kv)
 
 	s.Node.Handle("init", func(msg maelstrom.Message) error {
 		UserLog("Initializing counter to 0")
-		_, err := s.Store.ReadInt(context.Background(), "counter")
+		_, err := s.Store.ReadInt(context.Background(), counterKey)
 		if err != nil {
 			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
 				UserLog("Counter does not exist, initializing to 0")
-				err = s.Store.Write(context.Background(), "counter", 0)
+				err = s.Store.Write(context.Background(), counterKey, 0)
 				if err != nil {
 					UserLog("error initializing counter: " + err.Error())
 				}
@@ -67,16 +66,23 @@ func (s *Server) AddHandler(msg maelstrom.Message) error {
 		return err
 	}
 
-	delta_float, _ := body["delta"].(float64)
+	delta_float, ok := body["delta"].(float64)
+	if !ok {
+		return fmt.Errorf("invalid delta value")
+	}
 	delta := int(delta_float)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for {
-		ctr, err := s.Store.ReadInt(context.Background(), "counter")
+		ctr, err := s.Store.ReadInt(ctx, counterKey)
 		if err != nil {
 			return err
 		}
 
 		newCtr := ctr + delta
-		err = s.Store.CompareAndSwap(context.Background(), "counter", ctr, newCtr, false)
+		err = s.Store.CompareAndSwap(ctx, counterKey, ctr, newCtr, false)
 		if err == nil {
 			break
 		}
@@ -92,7 +98,7 @@ func (s *Server) ReadHandler(msg maelstrom.Message) error {
 	}
 
 	UserLog("Reading from store...")
-	currCount, err := s.Store.ReadInt(context.Background(), "counter")
+	currCount, err := s.Store.ReadInt(context.Background(), counterKey)
 	if err != nil {
 		return err
 	}
@@ -102,37 +108,6 @@ func (s *Server) ReadHandler(msg maelstrom.Message) error {
 	response["value"] = currCount
 
 	return s.Node.Reply(msg, response)
-}
-
-func getValAndReplace(s *Server, delta int) (error, bool) {
-	UserLog("doing compare and swap")
-	ctr, err := s.Store.ReadInt(context.Background(), "counter")
-	if err != nil {
-		return err, false
-	}
-
-	newCtr := ctr + delta
-	err = s.Store.CompareAndSwap(context.Background(), "counter", ctr, newCtr, true)
-	return err, true
-}
-
-func setupLogger() *os.File {
-	logDir := filepath.Join(os.Getenv("HOME"), "code", "maelstrom-echo", "counter")
-
-	err := os.MkdirAll(logDir, os.ModePerm)
-	if err != nil {
-		log.Fatal("Error creating logs directory:", err)
-	}
-
-	logFilePath := filepath.Join(logDir, "output.log")
-	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
-	if err != nil {
-		log.Fatal("Error opening log file:", err)
-	}
-
-	log.SetOutput(logFile)
-
-	return logFile
 }
 
 func UserLog(msg string) {
