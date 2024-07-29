@@ -90,21 +90,11 @@ func (s *Server) HandlePoll(msg maelstrom.Message) error {
 	for k, v := range offsetsRaw {
 		offsets[k] = v.(float64)
 	}
-	log.Printf("Offsets: %+v", offsets)
-
-	log.Printf("Current log: ")
-	for key, values := range s.Log {
-		log.Printf("Key: %s", key)
-		for _, v := range values {
-			log.Printf("  {Offset: %d, Value: %d}", v.Offset, v.Value)
-		}
-	}
 
 	s.logMu.RLock()
 	log_data := make(map[string][][]int)
 	for key, offset := range offsets {
 		int_offset := int(offset)
-		log.Printf("int offset to get: %d", int_offset)
 		for _, pair := range s.Log[key][int_offset:] {
 			if _, exists := log_data[key]; !exists {
 				log_data[key] = [][]int{}
