@@ -61,7 +61,7 @@ func (s *Server) HandleSend(msg maelstrom.Message) error {
 	}
 
 	// update list of offsets
-	offsetsKey := fmt.Sprintf("Log_%s", key)
+	offsetsKey := fmt.Sprintf("LogOffsets_%s", key)
 	for {
 		var offsets []int
 		err := s.KV.ReadInto(context.Background(), offsetsKey, &offsets)
@@ -176,6 +176,9 @@ func (s *Server) HandleListCommittedOffsets(msg maelstrom.Message) error {
 		fetch_key := "CommittedOffsets_" + key
 		committed_offset, err := s.KV.ReadInt(context.Background(), fetch_key)
 		if err != nil {
+			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+				continue
+			}
 			return err
 		}
 		committed_offsets[key] = committed_offset
@@ -192,6 +195,13 @@ func (s *Server) GetAndIncrementOffset(key string) (int, error) {
 	for {
 		currentValue, err := s.KV.ReadInt(context.Background(), fullKey)
 		if err != nil {
+			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+				err = s.KV.Write(context.Background(), fullKey, 1)
+				if err == nil {
+					return 1, nil
+				}
+				return 0, err
+			}
 			return 0, err
 		}
 
