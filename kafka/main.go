@@ -21,6 +21,11 @@ func NewServer(n *maelstrom.Node, kv *maelstrom.KV) *Server {
 	}
 }
 
+type LogState struct {
+	CurrentOffset   int
+	CommittedOffset int
+}
+
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -43,53 +48,43 @@ func (s *Server) HandleSend(msg maelstrom.Message) error {
 	}
 
 	key := body["key"].(string)
-	value_float, ok := body["msg"].(float64)
-	if !ok {
-		return fmt.Errorf("invalid value: %s", body["msg"])
-	}
-	value := int(value_float)
+	value := int(body["msg"].(float64))
 
-	offset, err := s.GetAndIncrementOffset(key)
-	if err != nil {
-		return err
-	}
-
-	// store the log entry
-	logEntryKey := fmt.Sprintf("Log_%s_%d", key, offset)
-	if err := s.KV.Write(context.Background(), logEntryKey, value); err != nil {
-		return err
-	}
-
-	// update list of offsets
-	offsetsKey := fmt.Sprintf("LogOffsets_%s", key)
 	for {
-		var offsets []int
-		err := s.KV.ReadInto(context.Background(), offsetsKey, &offsets)
+		var state LogState
+		err := s.KV.ReadInto(context.Background(), key, &state)
 		if err != nil {
 			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
-				err = s.KV.Write(context.Background(), offsetsKey, []int{offset})
-				if err == nil {
-					break
-				}
+				state = LogState{CurrentOffset: 0, CommittedOffset: 0}
+			} else {
+				return err
 			}
-			return err
 		}
 
-		newOffsets := append(offsets, offset)
-		err = s.KV.CompareAndSwap(context.Background(), offsetsKey, offsets, newOffsets, true)
+		newOffset := state.CurrentOffset + 1
+		newState := LogState{
+			CurrentOffset:   newOffset,
+			CommittedOffset: state.CommittedOffset,
+		}
+
+		err = s.KV.CompareAndSwap(context.Background(), key, state, newState, true)
 		if err == nil {
-			break
+			err = s.KV.Write(context.Background(), fmt.Sprintf("Log_%s_%d", key, newOffset), value)
+			if err != nil {
+				return err
+			}
+
+			return s.Node.Reply(msg, map[string]any{
+				"type":   "send_ok",
+				"offset": newOffset,
+			})
 		}
 		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
 			continue
 		}
+
 		return err
 	}
-
-	res := make(map[string]any)
-	res["type"] = "send_ok"
-	res["offset"] = offset
-	return s.Node.Reply(msg, res)
 }
 
 func (s *Server) HandlePoll(msg maelstrom.Message) error {
@@ -98,44 +93,29 @@ func (s *Server) HandlePoll(msg maelstrom.Message) error {
 		return err
 	}
 
-	offsetsRaw, ok := body["offsets"].(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("offsets field is not a map")
-	}
+	offsets := body["offsets"].(map[string]interface{})
+	msgs := make(map[string][][]int)
 
-	offsets := make(map[string]int)
-	for k, v := range offsetsRaw {
-		offsets[k] = int(v.(float64))
-	}
-
-	log_data := make(map[string][][]int)
 	for key, offset := range offsets {
-		offsetsKey := fmt.Sprintf("LogOffsets_%s", key)
-		var allOffsets []int
-		if err := s.KV.ReadInto(context.Background(), offsetsKey, &allOffsets); err != nil {
-			return err
+		startOffset := int(offset.(float64))
+		var state LogState
+		err := s.KV.ReadInto(context.Background(), key, &state)
+		if err != nil {
+			continue
 		}
 
-		for _, currOffset := range allOffsets {
-			if currOffset >= offset {
-				logEntryKey := fmt.Sprintf("Log_%s_%d", key, currOffset)
-				value, err := s.KV.ReadInt(context.Background(), logEntryKey)
-				if err != nil {
-					return err
-				}
-				if _, exists := log_data[key]; !exists {
-					log_data[key] = [][]int{}
-				}
-				log_data[key] = append(log_data[key], []int{currOffset, value})
+		for i := startOffset; i <= state.CurrentOffset; i++ {
+			value, err := s.KV.ReadInt(context.Background(), fmt.Sprintf("Log_%s_%d", key, i))
+			if err == nil {
+				msgs[key] = append(msgs[key], []int{i, value})
 			}
 		}
 	}
 
-	resp := make(map[string]any)
-	resp["type"] = "poll_ok"
-	resp["msgs"] = log_data
-
-	return s.Node.Reply(msg, resp)
+	return s.Node.Reply(msg, map[string]any{
+		"type": "poll_ok",
+		"msgs": msgs,
+	})
 }
 
 func (s *Server) HandleCommitOffsets(msg maelstrom.Message) error {
@@ -144,14 +124,31 @@ func (s *Server) HandleCommitOffsets(msg maelstrom.Message) error {
 		return err
 	}
 
-	offsetsMap, _ := body["offsets"].(map[string]interface{})
+	offsets := body["offsets"].(map[string]interface{})
 
-	for key, offsetRaw := range offsetsMap {
-		offset := int(offsetRaw.(float64))
-		fullKey := "CommittedOffsets_" + key
+	for key, offset := range offsets {
+		committedOffset := int(offset.(float64))
+		for {
+			var state LogState
+			err := s.KV.ReadInto(context.Background(), key, &state)
+			if err != nil {
+				break // skip key if it doesnt exist
+			}
 
-		err := s.KV.Write(context.Background(), fullKey, offset)
-		if err != nil {
+			newState := LogState{
+				CurrentOffset:   state.CurrentOffset,
+				CommittedOffset: committedOffset,
+			}
+
+			err = s.KV.CompareAndSwap(context.Background(), key, state, newState, true)
+			if err == nil {
+				break
+			}
+
+			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
+				continue // someone else updated state, try again
+			}
+
 			return err
 		}
 	}
@@ -165,57 +162,19 @@ func (s *Server) HandleListCommittedOffsets(msg maelstrom.Message) error {
 		return err
 	}
 
-	keys, ok := body["keys"].([]interface{})
-	if !ok {
-		return fmt.Errorf("keys field is not an array")
-	}
+	keys := body["keys"].([]interface{})
+	offsets := make(map[string]int)
 
-	committed_offsets := make(map[string]int)
-	for _, keyRaw := range keys {
-		key := keyRaw.(string)
-		fetch_key := "CommittedOffsets_" + key
-		committed_offset, err := s.KV.ReadInt(context.Background(), fetch_key)
-		if err != nil {
-			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
-				continue
-			}
-			return err
-		}
-		committed_offsets[key] = committed_offset
-	}
-
-	resp := make(map[string]any)
-	resp["type"] = "list_committed_offsets_ok"
-	resp["offsets"] = committed_offsets
-	return s.Node.Reply(msg, resp)
-}
-
-func (s *Server) GetAndIncrementOffset(key string) (int, error) {
-	fullKey := "CurOffsets_" + key
-	for {
-		currentValue, err := s.KV.ReadInt(context.Background(), fullKey)
-		if err != nil {
-			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
-				err = s.KV.Write(context.Background(), fullKey, 1)
-				if err == nil {
-					return 1, nil
-				}
-				return 0, err
-			}
-			return 0, err
-		}
-
-		newValue := currentValue + 1
-
-		err = s.KV.CompareAndSwap(context.Background(), fullKey, currentValue, newValue, false)
+	for _, key := range keys {
+		var state LogState
+		err := s.KV.ReadInto(context.Background(), key.(string), &state)
 		if err == nil {
-			return newValue, nil
+			offsets[key.(string)] = state.CommittedOffset
 		}
-
-		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
-			continue
-		}
-
-		return 0, err
 	}
+
+	return s.Node.Reply(msg, map[string]any{
+		"type":    "list_committed_offsets_ok",
+		"offsets": offsets,
+	})
 }
